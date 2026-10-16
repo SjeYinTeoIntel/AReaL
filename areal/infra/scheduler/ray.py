@@ -70,6 +70,7 @@ logger = logging.getLogger("RayScheduler")
 DEVICE_CONTROL_ENV_VARS = {
     "GPU": "CUDA_VISIBLE_DEVICES",
     "NPU": "ASCEND_RT_VISIBLE_DEVICES",
+    "XPU": "ZE_AFFINITY_MASK",
 }
 
 

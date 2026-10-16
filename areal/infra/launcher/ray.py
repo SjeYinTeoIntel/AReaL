@@ -65,6 +65,20 @@ LOG_WRITER_PING_TIMEOUT = 30  # seconds
 LOG_WRITER_DRAIN_TIMEOUT = 30  # seconds
 
 
+def accelerator_resource_kwargs(gpus: int | float) -> dict:
+    """Ray resource request for ``gpus`` accelerators on the current platform.
+
+    Ray only understands NVIDIA/AMD devices via the dedicated ``num_gpus``
+    argument. Every other accelerator (Ascend NPU, Intel XPU, ...) is advertised
+    as a custom resource keyed by ``ray_device_key`` and must be requested
+    through ``resources`` instead.
+    """
+    device_key = current_platform.ray_device_key
+    if device_key == "GPU":
+        return {"num_gpus": gpus}
+    return {"resources": {device_key: gpus}}
+
+
 def _select_trainer_node_count(
     train_world_size: int,
     available_nodes: int,
@@ -354,28 +368,16 @@ class RayLauncher:
             if placement_group is not None
             else "DEFAULT"
         )
-        if current_platform.ray_device_key == "NPU":
-            future = ray.remote(
-                num_cpus=cpus,
-                resources={"NPU": gpus},
-                memory=mem * 1024 * 1024,  # Convert MB to bytes
-                runtime_env=runtime_env,
-                scheduling_strategy=scheduling_strategy,
-            )(run_func_with_file_log).remote(
-                log_writer, job_name, file_path, func_name, *args, **kwargs
-            )
-            self.jobs[job_name] = future
-        else:
-            future = ray.remote(
-                num_cpus=cpus,
-                num_gpus=gpus,
-                memory=mem * 1024 * 1024,  # Convert MB to bytes
-                runtime_env=runtime_env,
-                scheduling_strategy=scheduling_strategy,
-            )(run_func_with_file_log).remote(
-                log_writer, job_name, file_path, func_name, *args, **kwargs
-            )
-            self.jobs[job_name] = future
+        future = ray.remote(
+            num_cpus=cpus,
+            memory=mem * 1024 * 1024,  # Convert MB to bytes
+            runtime_env=runtime_env,
+            scheduling_strategy=scheduling_strategy,
+            **accelerator_resource_kwargs(gpus),
+        )(run_func_with_file_log).remote(
+            log_writer, job_name, file_path, func_name, *args, **kwargs
+        )
+        self.jobs[job_name] = future
         return future
 
     def submit_array(
@@ -421,22 +423,13 @@ class RayLauncher:
         mem_per_node = mem_per_task * tasks_per_node
 
         if job_name not in self.placement_groups:
-            if current_platform.ray_device_key == "NPU":
-                device_bundles = [
-                    {
-                        "CPU": cpus_per_node,
-                        "NPU": gpus_per_node,
-                        "memory": mem_per_node * 1024 * 1024,  # Convert MB to bytes
-                    }
-                ] * nodes
-            else:
-                device_bundles = [
-                    {
-                        "CPU": cpus_per_node,
-                        "GPU": gpus_per_node,
-                        "memory": mem_per_node * 1024 * 1024,  # Convert MB to bytes
-                    }
-                ] * nodes
+            device_bundles = [
+                {
+                    "CPU": cpus_per_node,
+                    current_platform.ray_device_key: gpus_per_node,
+                    "memory": mem_per_node * 1024 * 1024,  # Convert MB to bytes
+                }
+            ] * nodes
             placement_group = ray.util.placement_group(
                 bundles=device_bundles, strategy="PACK"
             )

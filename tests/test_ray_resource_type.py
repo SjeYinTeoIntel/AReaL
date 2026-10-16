@@ -11,6 +11,7 @@ def cpu_only_driver(monkeypatch):
 
     monkeypatch.setattr(ray_utils.ray, "is_initialized", lambda: True)
     monkeypatch.setattr("areal.infra.platforms.is_npu_available", False)
+    monkeypatch.setattr("areal.infra.platforms.is_xpu_available", False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
@@ -18,6 +19,7 @@ def test_local_gpu_driver_reports_gpu(monkeypatch):
     import torch
 
     monkeypatch.setattr("areal.infra.platforms.is_npu_available", False)
+    monkeypatch.setattr("areal.infra.platforms.is_xpu_available", False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     assert ray_utils.ray_resource_type() == "GPU"
@@ -39,6 +41,24 @@ def test_cpu_only_driver_reports_cluster_npu(cpu_only_driver, monkeypatch):
     assert ray_utils.ray_resource_type() == "NPU"
 
 
+def test_local_xpu_driver_reports_xpu(monkeypatch):
+    import torch
+
+    monkeypatch.setattr("areal.infra.platforms.is_npu_available", False)
+    monkeypatch.setattr("areal.infra.platforms.is_xpu_available", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert ray_utils.ray_resource_type() == "XPU"
+
+
+def test_cpu_only_driver_reports_cluster_xpu(cpu_only_driver, monkeypatch):
+    monkeypatch.setattr(
+        ray_utils.ray, "cluster_resources", lambda: {"CPU": 32.0, "XPU": 16.0}
+    )
+
+    assert ray_utils.ray_resource_type() == "XPU"
+
+
 def test_cpu_only_driver_without_cluster_accelerators_reports_cpu(
     cpu_only_driver, monkeypatch
 ):
@@ -51,6 +71,7 @@ def test_disconnected_cpu_driver_does_not_query_cluster(monkeypatch):
     import torch
 
     monkeypatch.setattr("areal.infra.platforms.is_npu_available", False)
+    monkeypatch.setattr("areal.infra.platforms.is_xpu_available", False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(ray_utils.ray, "is_initialized", lambda: False)
 

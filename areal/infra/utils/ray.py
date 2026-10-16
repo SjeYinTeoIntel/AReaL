@@ -51,13 +51,16 @@ def ray_resource_type():
     # npu before cuda because mindspeed patches cuda.is_available
     import torch
 
-    from areal.infra.platforms import is_npu_available
+    from areal.infra.platforms import is_npu_available, is_xpu_available
 
     if is_npu_available:
         return "NPU"
 
     if torch.cuda.is_available():
         return "GPU"
+
+    if is_xpu_available:
+        return "XPU"
 
     return _cluster_accelerator_type() or "CPU"
 
@@ -69,7 +72,7 @@ def _cluster_accelerator_type() -> str | None:
         return None
 
     resources = ray.cluster_resources()
-    for device in ("NPU", "GPU"):
+    for device in ("NPU", "GPU", "XPU"):
         if resources.get(device, 0):
             return device
     return None
