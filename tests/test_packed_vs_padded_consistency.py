@@ -199,6 +199,19 @@ def mock_padded_vlm_data(model_path):
             ],
         )
 
+        # Qwen-VL M-RoPE needs per-token modality types; random text prefix is 0.
+        if "mm_token_type_ids" in processed_input:
+            image_token_types = processed_input["mm_token_type_ids"].reshape(-1)
+            seq["mm_token_type_ids"] = torch.cat(
+                [
+                    torch.zeros(
+                        len(input_ids) - len(image_input_id),
+                        dtype=image_token_types.dtype,
+                    ),
+                    image_token_types,
+                ]
+            ).unsqueeze(0)
+
         if "image_grid_thw" in processed_input:
             seq["multi_modal_input"][0]["image_grid_thw"] = processed_input[
                 "image_grid_thw"
@@ -242,6 +255,7 @@ def test_vlm_consistency(model_path):
         backend="fsdp:d1",
         path=model_path,
         dtype="bfloat16",
+        optimizer_dtype="bfloat16",
         attn_impl="flash_attention_2",
         gradient_checkpointing=False,
         disable_dropout=True,
