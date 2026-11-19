@@ -15,6 +15,8 @@ from areal.api.cli_args import (
     SchedulingStrategy,
     SchedulingStrategyType,
 )
+from areal.infra.platforms.cuda import CudaPlatform
+from areal.infra.platforms.xpu import XpuPlatform
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
     EngineCreationError,
@@ -575,6 +577,9 @@ class TestWorkerCreation:
         # Mock the platform to use CUDA_VISIBLE_DEVICES
         mock_platform = Mock()
         mock_platform.device_control_env_var = "CUDA_VISIBLE_DEVICES"
+        mock_platform.get_worker_device_env_vars = (
+            CudaPlatform.get_worker_device_env_vars
+        )
 
         with patch("areal.infra.scheduler.local.current_platform", mock_platform):
             scheduler = create_scheduler(tmp_path)
@@ -610,6 +615,55 @@ class TestWorkerCreation:
             assert "CUDA_VISIBLE_DEVICES=0" in cmd_str
             # Verify shell=True is used since cmd is a string
             assert popen_call[1]["shell"] is True
+
+            # Clean up workers while mock is still active
+            scheduler.delete_workers(None)
+
+    @patch("areal.infra.scheduler.local.gethostip")
+    @patch("areal.infra.scheduler.local.subprocess.Popen")
+    @patch("areal.infra.scheduler.local.find_free_ports")
+    def test_create_workers_on_xpu_share_device_visibility(
+        self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
+    ):
+        """XPU workers should all see the node's devices and differ by offset."""
+        mock_gethostip.return_value = "127.0.0.1"
+        mock_find_ports.side_effect = [[8000, 8001], [8002, 8003]]
+
+        mock_procs = [Mock(pid=1234), Mock(pid=1235)]
+        for mock_proc in mock_procs:
+            mock_proc.poll.return_value = None
+        mock_popen.side_effect = mock_procs
+
+        mock_platform = Mock()
+        mock_platform.device_control_env_var = "ZE_AFFINITY_MASK"
+        mock_platform.get_worker_device_env_vars = (
+            XpuPlatform.get_worker_device_env_vars
+        )
+
+        with patch("areal.infra.scheduler.local.current_platform", mock_platform):
+            scheduler = create_scheduler(tmp_path, gpu_devices=[0, 1])
+
+            job = Job(
+                replicas=2,
+                role="xputest",
+                tasks=[
+                    SchedulingSpec(
+                        cpu=1,
+                        mem=1024,
+                        gpu=1,
+                        port_count=2,
+                        cmd="python -m areal.infra.rpc.rpc_server",
+                    )
+                ],
+            )
+            with patch.object(scheduler, "_configure_worker", return_value=None):
+                scheduler.create_workers(job)
+
+            cmd_strs = [popen_call[0][0] for popen_call in mock_popen.call_args_list]
+            assert len(cmd_strs) == 2
+            for offset, cmd_str in enumerate(cmd_strs):
+                assert "ZE_AFFINITY_MASK=0,1" in cmd_str
+                assert f"AREAL_XPU_DEVICE_OFFSET={offset}" in cmd_str
 
             # Clean up workers while mock is still active
             scheduler.delete_workers(None)

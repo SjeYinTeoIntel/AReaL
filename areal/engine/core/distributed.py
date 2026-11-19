@@ -57,12 +57,12 @@ def warmup_process_groups(*groups: dist.ProcessGroup | None) -> None:
     # the helper usable under custom launchers that don't export LOCAL_RANK.
     local_rank_env = os.environ.get("LOCAL_RANK")
     if local_rank_env is not None:
-        local_rank = int(local_rank_env)
-        current_platform.set_device(local_rank)
+        device_index = current_platform.local_device_index(int(local_rank_env))
+        current_platform.set_device(device_index)
     else:
-        local_rank = current_platform.current_device()
+        device_index = current_platform.current_device()
 
-    device = torch.device(current_platform.device_type, local_rank)
+    device = torch.device(current_platform.device_type, device_index)
     tensor = torch.zeros(1, device=device)
     for group in unique_groups:
         dist.all_reduce(tensor, group=group)

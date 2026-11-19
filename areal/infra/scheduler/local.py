@@ -793,10 +793,11 @@ class LocalScheduler(Scheduler):
                     ) from e
 
                 env = get_env_vars(scheduling.env_vars)
-                if current_platform.device_control_env_var:
-                    env[current_platform.device_control_env_var] = ",".join(
-                        map(str, gpu_devices)
+                env.update(
+                    current_platform.get_worker_device_env_vars(
+                        gpu_devices, self.gpu_devices
                     )
+                )
 
                 thread_env = get_thread_env_vars(
                     cpus_per_task=scheduling.cpu,

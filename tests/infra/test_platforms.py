@@ -55,6 +55,53 @@ def test_xpu_visible_devices_do_not_set_empty_ray_noset_key():
     assert "" not in env_vars
 
 
+def test_worker_device_env_vars_default_to_assigned_devices():
+    assert CudaPlatform.get_worker_device_env_vars([1], [0, 1]) == {
+        "CUDA_VISIBLE_DEVICES": "1"
+    }
+    assert CudaPlatform.local_device_index(0) == 0
+
+
+def test_worker_device_env_vars_empty_without_device_control_env_var():
+    assert CpuPlatform.get_worker_device_env_vars([], []) == {}
+
+
+@pytest.mark.parametrize(
+    "gpu_devices,node_gpu_devices,mask,offset",
+    [
+        ([0], [0, 1], "0,1", "0"),
+        ([1], [0, 1], "0,1", "1"),
+        ([2, 3], [0, 1, 2, 3], "0,1,2,3", "2"),
+        ([3], [3, 1], "1,3", "1"),
+    ],
+)
+def test_xpu_workers_see_every_node_device(gpu_devices, node_gpu_devices, mask, offset):
+    """oneCCL needs each process of a communicator to see all of its devices."""
+    assert XpuPlatform.get_worker_device_env_vars(gpu_devices, node_gpu_devices) == {
+        "ZE_AFFINITY_MASK": mask,
+        "AREAL_XPU_DEVICE_OFFSET": offset,
+    }
+
+
+def test_xpu_worker_without_devices_keeps_empty_mask():
+    assert XpuPlatform.get_worker_device_env_vars([], [0, 1]) == {
+        "ZE_AFFINITY_MASK": ""
+    }
+
+
+def test_xpu_worker_device_env_vars_reject_non_consecutive_devices():
+    with pytest.raises(ValueError, match="consecutive devices"):
+        XpuPlatform.get_worker_device_env_vars([2, 0], [0, 1, 2])
+
+
+def test_xpu_local_device_index_adds_device_offset(monkeypatch):
+    monkeypatch.delenv("AREAL_XPU_DEVICE_OFFSET", raising=False)
+    assert XpuPlatform.local_device_index(1) == 1
+
+    monkeypatch.setenv("AREAL_XPU_DEVICE_OFFSET", "2")
+    assert XpuPlatform.local_device_index(1) == 3
+
+
 @pytest.mark.parametrize(
     "platform_cls,local_rank,expected",
     [
