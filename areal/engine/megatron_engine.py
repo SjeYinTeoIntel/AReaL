@@ -583,9 +583,12 @@ class MegatronEngine(TrainEngine):
         if is_tms_enabled():
             torch_memory_saver.hook_mode = "preload"
 
-        current_platform.set_device(int(os.environ["LOCAL_RANK"]))
-        current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
-        self.device = torch.device(int(os.environ["LOCAL_RANK"]))
+        device_index = current_platform.local_device_index(
+            int(os.environ["LOCAL_RANK"])
+        )
+        current_platform.set_device(device_index)
+        current_platform.set_numa_affinity(device_index)
+        self.device = torch.device(device_index)
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         self.is_pp_head = (

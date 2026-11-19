@@ -40,6 +40,8 @@ from areal.utils.vllm_response import parse_vllm_generation_response
 
 logger = logging.getLogger("vLLMEngine")
 
+_XPU_WORKER_CLS = "areal.engine.vllm_ext.xpu_worker.ArealXPUWorker"
+
 
 class VLLMBackend:
     """vLLM-specific backend implementation for remote inference."""
@@ -307,6 +309,10 @@ class VLLMBackend:
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch vLLM server subprocess."""
+        if current_platform.device_type == "xpu":
+            # XPU workers see every device of the node, so vLLM needs a worker
+            # that starts at the device the scheduler assigned.
+            server_args = {"worker_cls": _XPU_WORKER_CLS, **server_args}
         cmd = vLLMConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
 
