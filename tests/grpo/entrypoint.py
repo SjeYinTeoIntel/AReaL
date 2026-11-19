@@ -18,9 +18,13 @@ class MinimalPPOTrainer(PPOTrainer):
         super().__init__(*args, **kwargs)
         self.rewards_history = []
 
-    def _export_and_commit_stats(self, epoch, epoch_step, global_step):
-        # Collect stats before committing
-        stats = self.actor.export_stats()
+    def _export_and_commit_stats(
+        self, epoch, epoch_step, global_step, actor_stats_before_exchange=None
+    ):
+        # Collect stats before committing. Like PPOTrainer, merge actor stats
+        # exported before the weight exchange with the ones exported now.
+        stats = dict(actor_stats_before_exchange or {})
+        stats.update(self.actor.export_stats())
         self.rewards_history.append(stats["ppo_actor/task_reward/avg"])
 
 
