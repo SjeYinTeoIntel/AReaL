@@ -117,6 +117,30 @@ class Platform:
         return torch.device(f"{cls.device_type}:{local_rank}")
 
     @classmethod
+    def get_worker_device_env_vars(
+        cls, gpu_devices: list[int], node_gpu_devices: list[int]
+    ) -> dict[str, str]:
+        """Return the environment variables that bind a worker to its devices.
+
+        Args:
+            gpu_devices: Devices the scheduler assigned to the worker.
+            node_gpu_devices: Every device the scheduler manages on the node.
+
+        By default a worker only sees its own devices, so its first device is
+        always index 0. Platforms whose workers must see the whole node
+        override this together with ``local_device_index``.
+        """
+        if not cls.device_control_env_var:
+            return {}
+        return {cls.device_control_env_var: ",".join(map(str, gpu_devices))}
+
+    @classmethod
+    def local_device_index(cls, local_rank: int) -> int:
+        """Return the index of the device ``local_rank`` runs on, among the
+        devices visible to this process."""
+        return local_rank
+
+    @classmethod
     def set_numa_affinity(cls, local_rank: int) -> None:
         """Bind the current process to CPU cores near the assigned device."""
         return
