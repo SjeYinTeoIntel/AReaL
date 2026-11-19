@@ -1,9 +1,12 @@
 """Test suite for remote inference engines (vLLM and SGLang)."""
 
+import asyncio
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.distributed as dist
 
 from tests.utils import get_model_path
@@ -357,6 +360,7 @@ def inference_engine(request):
         os.environ["AREAL_LLM_SERVER_ADDRS"] = f"{server_info.host}:{server_info.port}"
 
         yield {
+            "backend": backend,
             "engine_class": engine_class,
             "expr_name": expr_name,
             "trial_name": trial_name,
@@ -637,3 +641,225 @@ def test_disk_update_weights_from_fsdp_engine(tmp_path_factory, inference_engine
         if inf_engine is not None:
             inf_engine.destroy()
         assert not dist.is_initialized()
+
+
+class _XcclSession:
+    """An FSDP engine connected once to the shared inference server over
+    NCCL/XCCL. The server keeps the group for its lifetime, so tests share one
+    connection, as a training run does."""
+
+    def __init__(self, train_engine, inf_engine, meta):
+        self.train_engine = train_engine
+        self.inf_engine = inf_engine
+        self.meta = meta
+        self.version = 0
+        self.original = {
+            name: param.detach().clone()
+            for name, param in train_engine.model.named_parameters()
+        }
+
+    def update(self, weight_chunked_mem_mb: int = 1024) -> None:
+        self.version += 1
+        self.meta.weight_chunked_mem_mb = weight_chunked_mem_mb
+        self.train_engine.set_version(self.version)
+        self.inf_engine.set_version(self.version)
+        self.train_engine.update_weights(self.meta)
+
+    def reset(self) -> None:
+        """Restore the original weights on the trainer and the server."""
+        with torch.no_grad():
+            for name, param in self.train_engine.model.named_parameters():
+                param.copy_(self.original[name])
+        self.update()
+
+    def param(self, name: str) -> torch.Tensor:
+        return dict(self.train_engine.model.named_parameters())[name]
+
+
+@pytest.fixture(scope="module")
+def xccl_session(inference_engine):
+    """Connect an FSDP engine to the inference server for distributed updates."""
+    from areal.api import FinetuneSpec, ModelAllocation
+    from areal.api.cli_args import OptimizerConfig, TrainEngineConfig
+    from areal.engine import FSDPEngine
+    from areal.infra.platforms import current_platform
+
+    # The inference server runs on device 0. Put the trainer on device 1 when
+    # available; XCCL also supports two ranks on one device, NCCL does not.
+    device_module = getattr(torch, current_platform.device_type, None)
+    if device_module is not None and device_module.device_count() >= 2:
+        local_rank = 1
+    elif current_platform.device_type == "xpu":
+        local_rank = 0
+    else:
+        pytest.skip("Requires 2 devices: NCCL cannot place two ranks on one GPU")
+
+    os.environ["WORLD_SIZE"] = "1"
+    os.environ["RANK"] = "0"
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(network.find_free_ports(1)[0])
+
+    allocation = f"{inference_engine['backend']}:d1"
+    train_engine = FSDPEngine(
+        TrainEngineConfig(
+            backend="fsdp:d1",
+            experiment_name=inference_engine["expr_name"],
+            trial_name=inference_engine["trial_name"],
+            path=MODEL_PATH,
+            optimizer=OptimizerConfig(),
+        )
+    )
+    train_engine.create_process_group()
+    inf_engine = None
+    try:
+        train_engine.initialize(
+            None,
+            FinetuneSpec(total_train_epochs=1, dataset_size=100, train_batch_size=2),
+        )
+        inf_engine = inference_engine["engine_class"](
+            InferenceEngineConfig(
+                backend=allocation,
+                experiment_name=inference_engine["expr_name"],
+                trial_name=inference_engine["trial_name"],
+                setup_timeout=360,
+            )
+        )
+        inf_engine.initialize()
+        meta = WeightUpdateMeta.from_fsdp_xccl(
+            gen_allocation=ModelAllocation.from_str(allocation)
+        )
+        train_engine.connect_engine(inf_engine, meta)
+        yield _XcclSession(train_engine, inf_engine, meta)
+    finally:
+        train_engine.destroy()
+        if inf_engine is not None:
+            inf_engine.destroy()
+        assert not dist.is_initialized()
+
+
+def _generate(inf_engine, input_ids: list[int], max_new_tokens: int = 8):
+    from areal.api import ModelRequest
+
+    req = ModelRequest(
+        input_ids=input_ids,
+        gconfig=GenerationHyperparameters(max_new_tokens=max_new_tokens, greedy=True),
+    )
+    return asyncio.run(inf_engine.agenerate(req))
+
+
+def _prompt_ids() -> list[int]:
+    return load_hf_tokenizer(MODEL_PATH).encode("The capital of France is")
+
+
+@pytest.mark.slow
+def test_xccl_update_weights_from_fsdp_engine(xccl_session):
+    """Zero the final norm on the trainer and broadcast it: greedy output must
+    change, and restoring the weight must bring the original output back."""
+    s = xccl_session
+    s.reset()
+    input_ids = _prompt_ids()
+    baseline = _generate(s.inf_engine, input_ids).output_tokens
+
+    with torch.no_grad():
+        s.param("model.norm.weight").zero_()
+    s.update()
+    perturbed = _generate(s.inf_engine, input_ids).output_tokens
+    assert perturbed != baseline, "inference output unchanged after weight update"
+
+    s.reset()
+    assert _generate(s.inf_engine, input_ids).output_tokens == baseline, (
+        "restored weights did not restore output"
+    )
+
+
+def _trainer_logprobs(train_engine, tokens: list[int]) -> torch.Tensor:
+    """Log-probabilities of tokens[1:] under the trainer's current weights."""
+    ids = torch.tensor([tokens], device=train_engine.device)
+    with torch.no_grad():
+        logits = train_engine.model(
+            input_ids=ids,
+            position_ids=torch.arange(len(tokens), device=ids.device)[None],
+        ).logits
+    logp = logits[0, :-1].float().log_softmax(-1)
+    return logp.gather(-1, ids[0, 1:, None]).squeeze(-1).cpu()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("weight_chunked_mem_mb", [1024, 16])
+def test_xccl_update_weights_logprobs_match_trainer(
+    xccl_session, weight_chunked_mem_mb
+):
+    """Perturb every trainer parameter, broadcast, and check that the inference
+    engine's logprobs match the trainer's. A small chunk size forces many
+    buckets through the pipelined broadcast path."""
+    s = xccl_session
+    s.reset()
+    input_ids = _prompt_ids()
+
+    def logprob_error() -> torch.Tensor:
+        resp = _generate(s.inf_engine, input_ids, max_new_tokens=16)
+        n_out = len(resp.output_tokens)
+        tokens = resp.input_tokens + resp.output_tokens
+        trainer_lp = _trainer_logprobs(s.train_engine, tokens)[-n_out:]
+        return (trainer_lp - torch.tensor(resp.output_logprobs)).abs().mean()
+
+    synced_before = logprob_error()
+
+    gen = torch.Generator().manual_seed(weight_chunked_mem_mb)
+    with torch.no_grad():
+        for _, param in s.train_engine.model.named_parameters():
+            local = param.to_local() if hasattr(param, "to_local") else param
+            noise = torch.randn(local.shape, generator=gen).to(local)
+            local.mul_(1 + 0.05 * noise)
+
+    # Before the update, the server still serves the original weights.
+    stale_err = logprob_error()
+    s.update(weight_chunked_mem_mb)
+    synced_err = logprob_error()
+
+    print(
+        f"chunk={weight_chunked_mem_mb}MB unperturbed_err={synced_before:.4f} "
+        f"stale_err={stale_err:.4f} synced_err={synced_err:.4f}",
+        flush=True,
+    )
+    assert synced_err < 0.05, f"logprobs differ after sync: {synced_err:.4f}"
+    assert synced_err < stale_err / 5, (
+        f"sync did not close the gap: stale={stale_err:.4f} synced={synced_err:.4f}"
+    )
+
+
+@pytest.mark.slow
+def test_xccl_repeated_weight_updates(xccl_session):
+    """Run many syncs, as in a GRPO run: no hang, stable trainer memory, and the
+    inference engine always serves the latest weights."""
+    from areal.infra.platforms import current_platform
+
+    s = xccl_session
+    s.reset()
+    n_updates = 20
+    input_ids = _prompt_ids()
+    baseline = _generate(s.inf_engine, input_ids).output_tokens
+    norm = s.param("model.norm.weight")
+    original = s.original["model.norm.weight"]
+    device_module = getattr(torch, current_platform.device_type)
+
+    mem = []
+    for step in range(1, n_updates + 1):
+        perturb = step % 2 == 1
+        with torch.no_grad():
+            norm.copy_(original * 0 if perturb else original)
+        start = time.perf_counter()
+        s.update()
+        elapsed = time.perf_counter() - start
+        out = _generate(s.inf_engine, input_ids).output_tokens
+        assert (out != baseline) == perturb, f"stale weights at update {step}"
+        current_platform.synchronize()
+        mem.append(device_module.memory_allocated())
+        print(
+            f"update {step}: {elapsed:.2f}s, trainer mem {mem[-1] / 2**20:.0f} MiB",
+            flush=True,
+        )
+
+    growth = max(mem[2:]) - mem[1]
+    assert growth < 64 * 2**20, f"trainer memory grew {growth / 2**20:.0f} MiB"
