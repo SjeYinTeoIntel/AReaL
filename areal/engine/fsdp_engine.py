@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import gc
+import inspect
 import math
 import os
 import re
@@ -185,7 +187,12 @@ class _PendingWeightUpdateBucket:
     stream: torch.cuda.Stream | None = None
 
 
-_MULTIMODAL_FORWARD_KEYS = ("image_grid_thw", "pixel_values", "video_grid_thw")
+_MULTIMODAL_FORWARD_KEYS = (
+    "image_grid_thw",
+    "pixel_values",
+    "pixel_values_videos",
+    "video_grid_thw",
+)
 
 
 def _is_multimodal_payload_key(key: str) -> bool:
@@ -225,6 +232,16 @@ def _prepare_multimodal_forward_inputs(
 
 
 class FSDPEngine(TrainEngine):
+    # Packed-sequence metadata for the *text* tokens, added in ``_prepare_mb_list``.
+    _TEXT_PACKING_KWARGS = (
+        "cu_seqlens",
+        "max_seqlen",
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "max_length_q",
+        "max_length_k",
+    )
+
     def __init__(self, config: TrainEngineConfig):
         self.config = config
         self.optimizer_config = config.optimizer
@@ -353,11 +370,12 @@ class FSDPEngine(TrainEngine):
 
         parallel_strategy = self._make_parallel_strategy(parallel_strategy)
 
-        if getattr(self.config, "use_score_centering", False) and (
-            parallel_strategy.tensor_parallel_size != 1
-            or parallel_strategy.context_parallel_size != 1
+        if (
+            getattr(self.config, "use_score_centering", False)
+            and parallel_strategy.tensor_parallel_size > 1
+            and self.model_config.vocab_size % parallel_strategy.tensor_parallel_size
         ):
-            raise ValueError("Score centering currently requires TP=SP=1.")
+            raise ValueError("FSDP score centering requires equal vocabulary shards.")
         self.parallel_helper = ParallelHelper.from_parallel_strategy(parallel_strategy)
 
         self.logger.info(
@@ -642,6 +660,7 @@ class FSDPEngine(TrainEngine):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        should_accept_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -649,6 +668,7 @@ class FSDPEngine(TrainEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            should_accept_kwargs=should_accept_kwargs,
             group_size=group_size,
             min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
@@ -964,9 +984,13 @@ class FSDPEngine(TrainEngine):
                     f"inferred {inferred_seqlens} from attention_mask shapes."
                 )
             output_seqlens = inferred_seqlens
-        cu_seqlens = pack_tensor_dict(input_batched)["cu_seqlens"]
         if output_seqlens is None:
-            output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
+            output_seqlens = (
+                input_batched["attention_mask"]
+                .sum(dim=1, dtype=torch.int64)
+                .cpu()
+                .tolist()
+            )
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 
@@ -1133,6 +1157,39 @@ class FSDPEngine(TrainEngine):
             )
         return model
 
+    @staticmethod
+    def _drop_text_packing_kwargs_hook(module, args, kwargs):
+        for key in FSDPEngine._TEXT_PACKING_KWARGS:
+            kwargs.pop(key, None)
+        return args, kwargs
+
+    @staticmethod
+    def _isolate_vision_tower_from_text_packing_kwargs(model: torch.nn.Module) -> None:
+        """Keep text packing kwargs out of the Qwen-VL vision tower.
+
+        Since transformers 5.9, Qwen-VL forwards ``**kwargs`` into the vision
+        tower, whose helpers treat ``cu_seqlens``/``max_seqlen`` as precomputed
+        vision values and whose attention passes ``max_length_q`` twice.
+        """
+        inner = getattr(model, "model", model)
+        visual = getattr(inner, "visual", None)
+        if visual is None:
+            return
+        visual.register_forward_pre_hook(
+            FSDPEngine._drop_text_packing_kwargs_hook, with_kwargs=True
+        )
+
+    @staticmethod
+    @functools.cache
+    def _mrope_takes_mm_token_type_ids(model_cls: type) -> bool:
+        """Whether Qwen-VL ``compute_3d_position_ids`` accepts ``mm_token_type_ids``.
+
+        transformers >= 5.3 locates vision tokens through ``mm_token_type_ids``;
+        earlier versions derive them from ``input_ids`` and reject the argument.
+        """
+        params = inspect.signature(model_cls.compute_3d_position_ids).parameters
+        return "mm_token_type_ids" in params
+
     def _create_device_model(self):
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
         current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
@@ -1190,6 +1247,8 @@ class FSDPEngine(TrainEngine):
                 )
                 if self.config.disable_dropout:
                     disable_dropout_in_model(model)
+            if is_qwen_vl_model(self.model_config.model_type):
+                self._isolate_vision_tower_from_text_packing_kwargs(model)
         else:
             self.tokenizer = load_hf_tokenizer(self.config.path)
             self.processor = None
@@ -2056,14 +2115,20 @@ class FSDPEngine(TrainEngine):
                 if video_grid_thw_list:
                     video_grid_thw = torch.cat(video_grid_thw_list)
 
+            mrope_kwargs = {}
+            if self._mrope_takes_mm_token_type_ids(type(self.model.model)):
+                mrope_kwargs["mm_token_type_ids"] = input_["mm_token_type_ids"]
+            else:
+                # Unused by this transformers version; keep it out of forward().
+                input_.pop("mm_token_type_ids", None)
             position_ids = self.model.model.compute_3d_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
                 attention_mask=attn_mask,
-                mm_token_type_ids=input_["mm_token_type_ids"],
                 inputs_embeds=None,
                 past_key_values=None,
+                **mrope_kwargs,
             )
             position_ids = torch.einsum("ijk->jki", position_ids)
             input_["position_ids"] = position_ids
@@ -2303,36 +2368,62 @@ class FSDPEngine(TrainEngine):
         if not self.config.is_critic:
             sc_correction = None
             if getattr(self.config, "use_score_centering", False):
-                if (
-                    self.enable_tree_training
-                    or self.parallel_helper.sp_size != 1
-                    or self.parallel_helper.tp_size != 1
-                ):
+                if self.enable_tree_training:
                     raise ValueError(
-                        "Score centering currently requires ordinary FSDP sequences with TP=SP=1."
+                        "Score centering requires ordinary FSDP sequences."
                     )
-                from areal.utils.score_centering import score_centering_logprobs
+                from areal.utils.score_centering import (
+                    resolve_score_centering_tis_cap,
+                    score_centering_logprobs,
+                )
 
-                n = logits.shape[0] - ctx.pad_length
-                labels = torch.roll(
-                    ctx.model_inputs["input_ids"], shifts=-1, dims=-1
-                ).reshape(-1)[:n]
                 ids = ctx.mb_input["sampler_head_ids"]
                 q = ctx.mb_input["sampler_head_logprobs"]
+                n = ctx.mb_input["input_ids"].numel()
                 if ids.ndim != 2 or ids.shape[0] != n or ids.shape != q.shape:
                     raise ValueError(
                         "Packed sampler heads must have shape [real_tokens, K]."
                     )
+                padding = ctx.pad_length + ctx.ulysses_pad_size
+                ids = torch.cat([ids, ids.new_zeros((padding, ids.shape[1]))])
+                q = torch.cat([q, q.new_full((padding, q.shape[1]), float("-inf"))])
+                if self.parallel_helper.sp_size > 1:
+                    rank = dist.get_rank(self.sp_group)
+                    ids = ids.chunk(self.parallel_helper.sp_size, dim=0)[rank]
+                    q = q.chunk(self.parallel_helper.sp_size, dim=0)[rank]
+                labels = ctx.model_inputs.get("rolled_input_ids")
+                if labels is None:
+                    labels = torch.roll(
+                        ctx.model_inputs["input_ids"], shifts=-1, dims=-1
+                    )
                 logprobs, entropy, sc_correction = score_centering_logprobs(
-                    logits[:n],
-                    labels,
+                    logits,
+                    labels.reshape(-1),
                     ids,
                     q,
                     chunk_size=self.config.logprobs_chunk_size,
+                    tis_cap=resolve_score_centering_tis_cap(
+                        getattr(self.config, "rejection_sampling", None)
+                    ),
+                    tp_group=self.parallel_helper.tp_group
+                    if self.parallel_helper.tp_size > 1
+                    else None,
+                    vocab_size=self.model_config.vocab_size
+                    if self.parallel_helper.tp_size > 1
+                    else None,
+                )
+                if self.parallel_helper.sp_size > 1:
+                    logprobs = self._sp_all_gather(logprobs)
+                    entropy = self._sp_all_gather(entropy)
+                    sc_correction = self._sp_all_gather(sc_correction)
+                logprobs, entropy, sc_correction = (
+                    value[:n] for value in (logprobs, entropy, sc_correction)
                 )
                 vocab_min_logits, vocab_max_logits = self._get_vocab_min_max_logits(
-                    logits[:n], 0
+                    logits, ctx.ulysses_pad_size
                 )
+                vocab_min_logits = vocab_min_logits[:n]
+                vocab_max_logits = vocab_max_logits[:n]
             elif self.enable_tree_training:
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
