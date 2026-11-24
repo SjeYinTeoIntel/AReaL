@@ -1518,7 +1518,7 @@ class FSDPEngine(TrainEngine):
         )
         full = build_packed_attention_mask(inputs["cu_seqlens"], seq_len, **mask_kwargs)
         sliding = full
-        hf_config = self.model_config
+        hf_config = getattr(self.model_config, "text_config", self.model_config)
         if "sliding_attention" in (getattr(hf_config, "layer_types", None) or []):
             sliding = build_packed_attention_mask(
                 inputs["cu_seqlens"],
